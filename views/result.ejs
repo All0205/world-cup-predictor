@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title><%= execution.team_a %> vs <%= execution.team_b %> - 预测结果</title>
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+  <div class="phone-frame">
+    <div class="page">
+      <header class="header">
+        <a href="/" class="back-btn">← 首页</a>
+        <h1 class="logo" style="font-size:1.1rem"><%= execution.team_a %> vs <%= execution.team_b %></h1>
+        <span class="badge badge-<%= execution.status %>"><%= execution.status === 'completed' ? '已完成' : execution.status %></span>
+      </header>
+
+      <%
+        var decisionOutput = '';
+        execution.results.forEach(function(r) {
+          if (r.agentName === '决策官') decisionOutput = r.output || '';
+        });
+
+        // 按"预测一/二/三"拆块，在每块中定位"比分"后20字符内的数字
+        var predictions = [];
+        if (decisionOutput) {
+          var sections = decisionOutput.split(/预测[一二三]/);
+          for (var i = 1; i < sections.length && predictions.length < 3; i++) {
+            var sec = sections[i];
+            var scoreIdx = sec.indexOf('比分');
+            if (scoreIdx >= 0) {
+              var near = sec.substring(scoreIdx, scoreIdx + 30);
+              var m = near.match(/(\d+)\s*[-–—]\s*(\d+)/);
+              if (m) { predictions.push({ score: m[1] + '-' + m[2] }); continue; }
+            }
+            // fallback: 该块内第一个比分
+            var m2 = sec.match(/(\d+)\s*[-–—]\s*(\d+)/);
+            if (m2) predictions.push({ score: m2[1] + '-' + m2[2] });
+          }
+        }
+      %>
+
+      <% if (predictions.length >= 3) { %>
+      <section class="section">
+        <div class="prediction-cards">
+          <div class="pred-card pred-primary">
+            <div class="pred-label">最可能比分</div>
+            <div class="pred-score"><%= predictions[0].score %></div>
+          </div>
+          <div class="pred-card pred-secondary">
+            <div class="pred-label">次可能比分</div>
+            <div class="pred-score"><%= predictions[1].score %></div>
+          </div>
+          <div class="pred-card pred-upset">
+            <div class="pred-label">冷门比分</div>
+            <div class="pred-score"><%= predictions[2].score %></div>
+          </div>
+        </div>
+      </section>
+      <% } else { %>
+        <div class="score-card">
+          <div class="score-teams">
+            <span class="score-team"><%= execution.team_a %></span>
+            <span class="score-vs">VS</span>
+            <span class="score-team"><%= execution.team_b %></span>
+          </div>
+          <div class="score-prediction" style="font-size:1.4rem; color: var(--text2)">查看下方分析</div>
+          <div class="score-meta"><%= execution.match_date || '' %> <%= execution.venue || '' %></div>
+        </div>
+      <% } %>
+
+      <section class="section">
+        <h2 class="section-title">Agent 执行过程</h2>
+        <% execution.results.forEach(function(r) { %>
+          <details class="agent-detail">
+            <summary class="agent-summary">
+              <span>
+                <% if (r.agentName.includes('检索')) { %>🔍<% } else if (r.agentName.includes('分析')) { %>📊<% } else { %>🎯<% } %>
+                <%= r.agentName %>
+              </span>
+              <span class="badge badge-<%= r.status %>"><%= r.status === 'completed' ? '✓' : r.status %></span>
+            </summary>
+            <div class="agent-output">
+              <% if (r.output) { %>
+                <%- r.output.replace(/\n/g, '<br>').replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>') %>
+              <% } else { %>
+                <p class="text-muted">无输出</p>
+              <% } %>
+            </div>
+          </details>
+        <% }) %>
+      </section>
+
+      <a href="/" class="btn btn-primary btn-lg btn-block" style="margin-bottom:24px">再预测一场</a>
+    </div>
+  </div>
+</body>
+</html>

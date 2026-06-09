@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>世界杯比分预测</title>
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+  <div class="phone-frame">
+    <div class="page">
+      <header class="header">
+        <h1 class="logo">⚽ 世界杯比分预测</h1>
+        <p class="subtitle">3 Agent 协同 · 多维分析 · 情景预测</p>
+      </header>
+
+      <!-- 日期选择 -->
+      <section class="section">
+        <h2 class="section-title">选择比赛日期</h2>
+        <select class="date-select" id="date-select" onchange="onDateChange(this.value)">
+          <option value="">请选择日期</option>
+          <% calendar.forEach(function(day) { %>
+            <option value="<%= day.date %>" <%= day.hasMatches ? '' : 'disabled' %>>
+              <%= day.date %><%= day.hasMatches ? ' (' + day.matches.length + '场比赛)' : ' — 无比赛' %>
+            </option>
+          <% }) %>
+        </select>
+      </section>
+
+      <!-- 比赛选择 -->
+      <section class="section" id="match-section" style="display:none;">
+        <h2 class="section-title" id="match-section-title">选择比赛</h2>
+        <div class="match-list" id="match-list"></div>
+      </section>
+
+      <!-- 最近预测 -->
+      <% if (recent.length > 0) { %>
+      <section class="section">
+        <h2 class="section-title">最近预测</h2>
+        <div class="history-list">
+          <% recent.forEach(function(r) { %>
+            <a href="/result/<%= r.id %>" class="history-item">
+              <div class="history-teams"><%= r.team_a %> vs <%= r.team_b %></div>
+              <div class="history-meta">
+                <span class="badge badge-<%= r.status %>"><%= r.status === 'completed' ? '已完成' : r.status %></span>
+                <span class="history-time"><%= r.created_at %></span>
+              </div>
+            </a>
+          <% }) %>
+        </div>
+      </section>
+      <% } %>
+    </div>
+  </div>
+
+<script>
+var calendarData = <%- JSON.stringify(calendar) %>;
+
+function onDateChange(date) {
+  var section = document.getElementById('match-section');
+  var list = document.getElementById('match-list');
+  if (!date) { section.style.display = 'none'; return; }
+
+  var day = calendarData.find(function(d) { return d.date === date; });
+  if (!day || day.matches.length === 0) { section.style.display = 'none'; return; }
+
+  list.innerHTML = day.matches.map(function(m) {
+    return '<a href="/predict?home=' + encodeURIComponent(m.home) + '&away=' + encodeURIComponent(m.away) + '&date=' + encodeURIComponent(m.date) + '&venue=' + encodeURIComponent(m.venue) + '" class="match-card">' +
+      '<div class="match-teams">' + m.home + ' <span class="match-vs">vs</span> ' + m.away + '</div>' +
+      '<div class="match-info">' + m.venue + ' · ' + m.group + '组</div>' +
+      '</a>';
+  }).join('');
+
+  section.style.display = 'block';
+  document.getElementById('match-section-title').textContent = date + ' 比赛';
+}
+</script>
+</body>
+</html>

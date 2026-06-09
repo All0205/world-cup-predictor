@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>预测 <%= home %> vs <%= away %></title>
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+  <div class="phone-frame">
+    <div class="page">
+      <header class="header">
+        <a href="/" class="back-btn">← 返回</a>
+        <h1 class="logo" style="font-size:1.2rem"><%= home %> vs <%= away %></h1>
+      </header>
+
+      <div class="predict-match-info">
+        <div><%= date %> · <%= venue %></div>
+      </div>
+
+      <button class="btn btn-primary btn-lg btn-block" id="start-btn" onclick="startPredict()">开始预测</button>
+
+      <section class="section" id="progress-section" style="display:none;">
+        <h2 class="section-title">Agent 执行中</h2>
+        <div class="progress-steps" id="progress-steps"></div>
+        <p id="progress-hint" class="text-muted"></p>
+      </section>
+    </div>
+  </div>
+
+<script>
+async function startPredict() {
+  document.getElementById('start-btn').style.display = 'none';
+  document.getElementById('progress-section').style.display = 'block';
+
+  var agentNames = ['信息检索师', '信息分析师', '决策官'];
+  var stepsDiv = document.getElementById('progress-steps');
+  stepsDiv.innerHTML = agentNames.map(function(n) {
+    return '<div class="progress-step pending" id="step-' + n + '">⏳ ' + n + '</div>';
+  }).join('');
+
+  var hint = document.getElementById('progress-hint');
+  hint.textContent = '正在初始化...';
+
+  var resp = await fetch('/api/predict', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      teamA: '<%= home %>',
+      teamB: '<%= away %>',
+      matchDate: '<%= date %>',
+      venue: '<%= venue %>'
+    })
+  });
+  var data = await resp.json();
+  if (data.executionId) {
+    if (data.status === 'completed') {
+      // 缓存命中，直接跳转
+      window.location.href = '/result/' + data.executionId;
+      return;
+    }
+    hint.textContent = 'Agent 正在工作...';
+    pollResult(data.executionId, agentNames, hint);
+  }
+}
+
+async function pollResult(executionId, agentNames, hint) {
+  var resp = await fetch('/api/executions/' + executionId);
+  var data = await resp.json();
+  if (data.results) {
+    data.results.forEach(function(r) {
+      var el = document.getElementById('step-' + r.agentName);
+      if (el) {
+        if (r.status === 'running') { el.className = 'progress-step running'; el.innerHTML = '🔄 ' + r.agentName; }
+        if (r.status === 'completed') { el.className = 'progress-step completed'; el.innerHTML = '✅ ' + r.agentName; }
+        if (r.status === 'failed') { el.className = 'progress-step failed'; el.innerHTML = '❌ ' + r.agentName; }
+      }
+    });
+    var done = data.results.filter(function(r) { return r.status === 'completed'; }).length;
+    hint.textContent = '已完成 ' + done + '/' + data.results.length + ' 个Agent';
+  }
+  if (data.status === 'completed' || data.status === 'failed') {
+    window.location.href = '/result/' + executionId;
+  } else {
+    setTimeout(function() { pollResult(executionId, agentNames, hint); }, 1500);
+  }
+}
+</script>
+</body>
+</html>
