@@ -1,0 +1,6 @@
+{
+  "envId": "cloud1-d2guhnpzqb793b53f",
+  "cloudrun": {
+    "name": "world-cup-predictor"
+  }
+}

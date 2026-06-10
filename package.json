@@ -4,6 +4,7 @@
   "description": "世界杯比分预测 - 多Agent工作流平台",
   "main": "server.js",
   "scripts": {
+    "build": "node -e \"process.exit(0)\"",
     "start": "node server.js",
     "dev": "nodemon server.js"
   },
