@@ -14,15 +14,26 @@
         <p class="subtitle">3 Agent 协同 · 多维分析 · 情景预测</p>
       </header>
 
+      <!-- 赛程刷新 -->
+      <section class="section">
+        <button class="btn btn-refresh" id="refresh-btn" onclick="refreshSchedule()">
+          🔄 刷新赛程
+        </button>
+        <p class="refresh-hint text-muted" id="refresh-hint">淘汰赛对阵确定后，点击刷新获取最新赛程</p>
+        <div class="refresh-result" id="refresh-result" style="display:none;"></div>
+      </section>
+
       <!-- 日期选择 -->
       <section class="section">
         <h2 class="section-title">选择比赛日期</h2>
         <select class="date-select" id="date-select" onchange="onDateChange(this.value)">
           <option value="">请选择日期</option>
           <% calendar.forEach(function(day) { %>
+            <% if (!day.allCompleted) { %>
             <option value="<%= day.date %>" <%= day.hasMatches ? '' : 'disabled' %>>
               <%= day.date %><%= day.hasMatches ? ' (' + day.matches.length + '场比赛)' : ' — 无比赛' %>
             </option>
+            <% } %>
           <% }) %>
         </select>
       </section>
@@ -56,6 +67,39 @@
 <script>
 var calendarData = <%- JSON.stringify(calendar) %>;
 
+async function refreshSchedule() {
+  var btn = document.getElementById('refresh-btn');
+  var hint = document.getElementById('refresh-hint');
+  var result = document.getElementById('refresh-result');
+  btn.disabled = true;
+  btn.innerHTML = '⏳ 正在搜索最新赛程...';
+  hint.textContent = '正在搜索新闻 + AI 提取对阵，约需 5-10 秒';
+  result.style.display = 'none';
+  try {
+    var resp = await fetch('/api/matches/refresh', { method: 'POST' });
+    var data = await resp.json();
+    btn.innerHTML = '✅ 刷新完成';
+    hint.textContent = data.message || '赛程已更新';
+    if (data.updated > 0) {
+      result.style.display = 'block';
+      result.className = 'refresh-result refresh-success';
+      result.innerHTML = '<strong>成功更新 ' + data.updated + ' 场比赛：</strong><br>' +
+        (data.details || []).map(function(d) {
+          return d.date + ' ' + d.stage + ': ' + d.home + ' vs ' + d.away;
+        }).join('<br>');
+      setTimeout(function() { location.reload(); }, 2000);
+    } else {
+      result.style.display = 'block';
+      result.className = 'refresh-result refresh-info';
+      result.textContent = data.message || '暂无新的赛程更新';
+    }
+  } catch (err) {
+    btn.innerHTML = '🔄 刷新赛程';
+    hint.textContent = '刷新失败: ' + err.message + '，请稍后重试';
+  }
+  btn.disabled = false;
+}
+
 function onDateChange(date) {
   var section = document.getElementById('match-section');
   var list = document.getElementById('match-list');
@@ -65,9 +109,24 @@ function onDateChange(date) {
   if (!day || day.matches.length === 0) { section.style.display = 'none'; return; }
 
   list.innerHTML = day.matches.map(function(m) {
+    var isPlaceholder = m.home.includes('组') || m.home.includes('胜者') || m.home.includes('败者') || m.away.includes('组') || m.away.includes('胜者') || m.away.includes('败者');
+    var isCompleted = m.status === 'completed';
+
+    if (isCompleted) {
+      return '<div class="match-card match-completed">' +
+        '<div class="match-teams">' + m.home + ' <span class="match-vs">vs</span> ' + m.away + '</div>' +
+        '<div class="match-info">✅ 已结束 · ' + m.venue + ' · ' + (m.stage || '') + '</div>' +
+        '</div>';
+    }
+    if (isPlaceholder) {
+      return '<div class="match-card match-pending">' +
+        '<div class="match-teams">' + m.home + ' <span class="match-vs">vs</span> ' + m.away + '</div>' +
+        '<div class="match-info"><span class="badge badge-pending">待定</span> ' + m.venue + ' · ' + (m.stage || '') + '</div>' +
+        '</div>';
+    }
     return '<a href="/predict?home=' + encodeURIComponent(m.home) + '&away=' + encodeURIComponent(m.away) + '&date=' + encodeURIComponent(m.date) + '&venue=' + encodeURIComponent(m.venue) + '" class="match-card">' +
       '<div class="match-teams">' + m.home + ' <span class="match-vs">vs</span> ' + m.away + '</div>' +
-      '<div class="match-info">' + m.venue + ' · ' + m.group + '组</div>' +
+      '<div class="match-info">' + m.venue + ' · ' + (m.stage || m.group + '组') + '</div>' +
       '</a>';
   }).join('');
 

@@ -1,12 +1,11 @@
 require('dotenv').config();
 const express = require('express');
 const path = require('path');
-const { db, init, getCachedPrediction, cachePrediction, updateLastChecked, getLastChecked, invalidatePrediction, invalidateAllForTeam } = require('./database');
+const { db, init, getAllMatches, updateMatchTeams, getMatchesByDate, updateMatchStatus, getCompletedCountForDate, getTotalCountForDate, getCachedPrediction, cachePrediction, updateLastChecked, getLastChecked, invalidatePrediction, invalidateAllForTeam } = require('./database');
 const { loadAgents, loadWorkflow } = require('./agent-loader');
 
 const app = express();
 const PORT = 5051;
-const matches = require('./matches.json');
 
 app.set('view engine', 'ejs');
 app.set('views', path.join(__dirname, 'views'));
@@ -14,29 +13,33 @@ app.use(express.static(path.join(__dirname, 'public')));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// 生成全部日期（6月11日–7月19日），标注哪些有比赛
+// 生成全部日期（6月11日–7月20日），标注哪些有比赛，过滤已全部结束的日期
 function getMatchCalendar() {
-  const matchDates = [...new Set(matches.map(m => m.date))];
+  const allMatches = getAllMatches();
   const matchMap = {};
-  matches.forEach(m => {
+  allMatches.forEach(m => {
     if (!matchMap[m.date]) matchMap[m.date] = [];
     matchMap[m.date].push(m);
   });
 
   const result = [];
-  // 6月11日 → 7月19日
-  const start = new Date(2026, 5, 11); // month 5 = June
-  const end = new Date(2026, 6, 19);   // month 6 = July
+  const start = new Date(2026, 5, 11);
+  const end = new Date(2026, 6, 20);
 
   for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
     const month = d.getMonth() + 1;
     const day = d.getDate();
     const key = month + '月' + day + '日';
-    const hasMatches = matchDates.includes(key);
+    const dayMatches = matchMap[key] || [];
+    const hasMatches = dayMatches.length > 0;
+    const completedCount = dayMatches.filter(m => m.status === 'completed').length;
+    const allCompleted = hasMatches && completedCount === dayMatches.length;
+
     result.push({
       date: key,
       hasMatches,
-      matches: matchMap[key] || []
+      allCompleted,           // 当天全部比赛已结束
+      matches: dayMatches
     });
   }
   return result;
@@ -45,6 +48,8 @@ function getMatchCalendar() {
 // ── 页面路由 ──
 
 app.get('/', (req, res) => {
+  autoRefreshKnockout();    // 后台自动检查淘汰赛更新
+  detectCompletedMatches();  // 后台自动检测已结束的比赛
   const calendar = getMatchCalendar();
   const recent = db.prepare('SELECT * FROM executions ORDER BY created_at DESC LIMIT 5').all();
   recent.forEach(r => { r.results = JSON.parse(r.results); });
@@ -132,6 +137,233 @@ app.get('/api/executions/:id', (req, res) => {
   if (!execution) return res.status(404).json({ error: 'Not found' });
   execution.results = JSON.parse(execution.results);
   res.json(execution);
+});
+
+// ── 淘汰赛赛程自动更新 ──
+
+let lastAutoRefresh = 0;
+const AUTO_REFRESH_INTERVAL = 6 * 60 * 60 * 1000; // 每6小时最多自动检查一次
+
+async function autoRefreshKnockout() {
+  const now = Date.now();
+  if (now - lastAutoRefresh < AUTO_REFRESH_INTERVAL) return;
+  lastAutoRefresh = now;
+
+  try {
+    const allMatches = getAllMatches();
+    const placeholders = allMatches.filter(m =>
+      m.home.includes('胜者') || m.home.includes('败者') ||
+      m.home.includes('组') || m.away.includes('组') ||
+      m.away.includes('胜者') || m.away.includes('败者')
+    );
+    if (placeholders.length === 0) return; // 全部已确定，无需刷新
+
+    console.log('  [自动刷新] 检测到', placeholders.length, '场待定赛程，开始搜索...');
+
+    const now2 = new Date();
+    const dateStr = `${now2.getFullYear()}年${now2.getMonth() + 1}月`;
+    const searchResult = await searchTavily(
+      `2026 世界杯 淘汰赛 晋级 对阵 ${dateStr} 16强 8强`,
+      3
+    );
+
+    if (!searchResult || searchResult.results.length === 0) return;
+
+    let newsText = searchResult.answer || '';
+    newsText += '\n' + searchResult.results.map(r => `- ${r.title}: ${r.content}`).join('\n');
+
+    const Anthropic = require('@anthropic-ai/sdk');
+    const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+    const msg = await anthropic.messages.create({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 1024,
+      temperature: 0,
+      system: '你是世界杯赛程数据提取器。从新闻中提取已确认的淘汰赛对阵。只提取官方确认的比赛结果和晋级球队。输出JSON数组，每项格式：{"stage":"阶段","date":"日期","home":"球队A","away":"球队B"}。stage用中文：1/16决赛、1/8决赛、1/4决赛、半决赛、三四名决赛、决赛。如果没有找到任何确认的对阵，输出空数组[]。',
+      messages: [{
+        role: 'user',
+        content: `当前待更新的淘汰赛占位：\n${placeholders.map(m => `[${m.id}] ${m.date} ${m.stage}: ${m.home} vs ${m.away}`).join('\n')}\n\n最新新闻：\n${newsText.substring(0, 4000)}`
+      }],
+    });
+
+    const reply = msg.content.filter(c => c.type === 'text').map(c => c.text).join('').trim();
+    const jsonMatch = reply.match(/\[[\s\S]*\]/);
+    if (!jsonMatch) return;
+
+    const updates = JSON.parse(jsonMatch[0]);
+    let updated = 0;
+    for (const update of updates) {
+      const match = allMatches.find(m =>
+        m.date === update.date && m.stage === update.stage &&
+        (m.home.includes('胜者') || m.home.includes('败者') || m.home.includes('组'))
+      );
+      if (match) {
+        updateMatchTeams(match.id, update.home, update.away);
+        updated++;
+      }
+    }
+    if (updated > 0) console.log('  [自动刷新] 成功更新', updated, '场比赛');
+  } catch (err) {
+    console.error('  [自动刷新] 失败:', err.message);
+  }
+}
+
+// ── 比赛结果自动检测 ──
+
+async function detectCompletedMatches() {
+  try {
+    const allMatches = getAllMatches();
+    const upcoming = allMatches.filter(m =>
+      m.status === 'upcoming' && !m.home.includes('组') && !m.home.includes('胜者') && !m.home.includes('败者') &&
+      !m.away.includes('组') && !m.away.includes('胜者') && !m.away.includes('败者')
+    );
+
+    if (upcoming.length === 0) return;
+
+    const now = new Date();
+    const today = `${now.getMonth() + 1}月${now.getDate()}日`;
+
+    // 只检查今天及之前日期的比赛
+    const dueMatches = upcoming.filter(m => {
+      const mParts = m.date.match(/(\d+)月(\d+)日/);
+      if (!mParts) return false;
+      const tParts = today.match(/(\d+)月(\d+)日/);
+      if (!tParts) return false;
+      const mVal = parseInt(mParts[1]) * 100 + parseInt(mParts[2]);
+      const tVal = parseInt(tParts[1]) * 100 + parseInt(tParts[2]);
+      return mVal <= tVal;
+    });
+
+    if (dueMatches.length === 0) return;
+
+    console.log('  [结果检测] 检测到', dueMatches.length, '场可检查的比赛');
+
+    const teamNames = [...new Set(dueMatches.flatMap(m => [m.home, m.away]))];
+    const query = `世界杯 比分 结果 ${teamNames.slice(0, 5).join(' ')} ${today}`;
+    const searchResult = await searchTavily(query, 2);
+
+    if (!searchResult || searchResult.results.length === 0) return;
+
+    let newsText = searchResult.answer || '';
+    newsText += '\n' + searchResult.results.map(r => `- ${r.title}: ${r.content}`).join('\n');
+
+    const Anthropic = require('@anthropic-ai/sdk');
+    const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+    const msg = await anthropic.messages.create({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 512,
+      temperature: 0,
+      system: '你是一个比赛结果提取器。根据新闻判断哪些比赛已经结束（有最终比分）。输出JSON数组，每项格式：{"home":"球队A","away":"球队B","completed":true}。只输出已确认结束的比赛，不确定的比赛不要包含。如果没有任何比赛确认结束，输出空数组[]。',
+      messages: [{
+        role: 'user',
+        content: `以下比赛可能已经进行，请判断哪些已经结束：\n${dueMatches.map(m => `- ${m.date} ${m.home} vs ${m.away} (${m.stage})`).join('\n')}\n\n最新新闻：\n${newsText.substring(0, 3000)}`
+      }],
+    });
+
+    const reply = msg.content.filter(c => c.type === 'text').map(c => c.text).join('').trim();
+    const jsonMatch = reply.match(/\[[\s\S]*\]/);
+    if (!jsonMatch) return;
+
+    const results = JSON.parse(jsonMatch[0]);
+    let updated = 0;
+    for (const r of results) {
+      if (!r.completed) continue;
+      const match = dueMatches.find(m => m.home === r.home && m.away === r.away);
+      if (match) {
+        updateMatchStatus(match.id, 'completed');
+        console.log('  [结果检测] ✅', match.date, match.home, 'vs', match.away, '已结束');
+        updated++;
+      }
+    }
+    if (updated > 0) console.log('  [结果检测] 标记', updated, '场比赛为已完成');
+  } catch (err) {
+    console.error('  [结果检测] 失败:', err.message);
+  }
+}
+
+app.post('/api/matches/refresh', async (req, res) => {
+  try {
+    const allMatches = getAllMatches();
+    const placeholders = allMatches.filter(m =>
+      m.home.includes('胜者') || m.home.includes('败者') ||
+      m.home.includes('组') || m.away.includes('组') ||
+      m.away.includes('胜者') || m.away.includes('败者')
+    );
+
+    if (placeholders.length === 0) {
+      return res.json({ updated: 0, message: '所有赛程已确定，无需更新' });
+    }
+
+    const now = new Date();
+    const dateStr = `${now.getFullYear()}年${now.getMonth() + 1}月`;
+
+    // 搜索最新淘汰赛对阵
+    const searchResult = await searchTavily(
+      `2026 世界杯 淘汰赛 对阵 ${dateStr} 16强 8强 晋级 结果`,
+      3
+    );
+
+    if (!searchResult || searchResult.results.length === 0) {
+      return res.json({ updated: 0, message: '未搜索到淘汰赛最新信息，请稍后再试' });
+    }
+
+    let newsText = searchResult.answer || '';
+    newsText += '\n' + searchResult.results.map(r => `- ${r.title}: ${r.content}`).join('\n');
+
+    // 让 Claude 提取已确定的淘汰赛对阵
+    const Anthropic = require('@anthropic-ai/sdk');
+    const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+    const msg = await anthropic.messages.create({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 1024,
+      temperature: 0,
+      system: '你是世界杯赛程数据提取器。从新闻中提取已确认的淘汰赛对阵。只提取官方确认的比赛结果和晋级球队。输出JSON数组，每项格式：{"stage":"阶段","date":"日期","home":"球队A","away":"球队B"}。stage用中文：1/16决赛、1/8决赛、1/4决赛、半决赛、三四名决赛、决赛。如果没有找到任何确认的对阵，输出空数组[]。',
+      messages: [{
+        role: 'user',
+        content: `当前待更新的淘汰赛占位：\n${placeholders.map(m => `[${m.id}] ${m.date} ${m.stage}: ${m.home} vs ${m.away}`).join('\n')}\n\n最新新闻：\n${newsText.substring(0, 4000)}`
+      }],
+    });
+
+    const reply = msg.content.filter(c => c.type === 'text').map(c => c.text).join('').trim();
+    console.log('  [赛程更新] Claude 回复:', reply.substring(0, 300));
+
+    // 解析 JSON 回复
+    const jsonMatch = reply.match(/\[[\s\S]*\]/);
+    if (!jsonMatch) {
+      return res.json({ updated: 0, message: '未能解析出有效的对阵信息，请稍后再试', raw: reply.substring(0, 200) });
+    }
+
+    const updates = JSON.parse(jsonMatch[0]);
+    let updated = 0;
+
+    for (const update of updates) {
+      // 找到匹配的占位符（按日期+阶段匹配）
+      const match = allMatches.find(m =>
+        m.date === update.date && m.stage === update.stage &&
+        (m.home.includes('胜者') || m.home.includes('败者') || m.home.includes('组'))
+      );
+      if (match) {
+        updateMatchTeams(match.id, update.home, update.away);
+        console.log(`  [赛程更新] #${match.id} ${update.date} ${update.stage}: ${update.home} vs ${update.away}`);
+        updated++;
+      }
+    }
+
+    res.json({ updated, message: `成功更新 ${updated} 场比赛`, details: updates });
+  } catch (err) {
+    console.error('  [赛程更新] 失败:', err.message);
+    res.status(500).json({ error: '刷新失败: ' + err.message });
+  }
+});
+
+// 手动更新某场比赛的队名
+app.post('/api/matches/update', (req, res) => {
+  const { id, home, away } = req.body;
+  if (!id || !home || !away) return res.status(400).json({ error: '缺少 id/home/away' });
+  updateMatchTeams(id, home, away);
+  res.json({ success: true, id, home, away });
 });
 
 // ── 实时搜索（Tavily API）──

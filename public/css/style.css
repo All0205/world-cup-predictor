@@ -419,6 +419,20 @@ body {
 
 .match-card:active { border-color: var(--primary); }
 
+.match-card.match-pending {
+  opacity: 0.5;
+  cursor: default;
+  border-style: dashed;
+  pointer-events: none;
+}
+
+.match-card.match-completed {
+  opacity: 0.45;
+  cursor: default;
+  pointer-events: none;
+  background: var(--bg);
+}
+
 .match-card.active {
   border-color: var(--primary);
   background: rgba(0,200,83,0.05);
@@ -493,6 +507,36 @@ body {
   font-weight: 800;
   color: var(--warning);
 }
+
+.btn-refresh {
+  width: 100%;
+  background: var(--surface2);
+  border: 1px dashed var(--border);
+  color: var(--text2);
+  padding: 12px;
+  border-radius: var(--radius-sm);
+  font-size: 0.95rem;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.btn-refresh:hover { border-color: var(--primary); color: var(--primary); }
+.btn-refresh:disabled { opacity: 0.6; cursor: wait; }
+
+.refresh-hint {
+  font-size: 0.8rem;
+  margin-top: 6px;
+  text-align: center;
+}
+
+.refresh-result {
+  margin-top: 10px;
+  padding: 12px;
+  border-radius: var(--radius-sm);
+  font-size: 0.85rem;
+  line-height: 1.6;
+}
+.refresh-success { background: rgba(0,200,83,0.1); border: 1px solid var(--primary); color: var(--primary); }
+.refresh-info { background: rgba(59,130,246,0.1); border: 1px solid #3b82f6; color: #93c5fd; }
 
 /* ── Decision Content ── */
 .decision-content {
