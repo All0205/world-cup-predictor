@@ -1,7 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const path = require('path');
-const { db, init } = require('./database');
+const { db, init, getCachedPrediction, cachePrediction, updateLastChecked, getLastChecked, invalidatePrediction, invalidateAllForTeam } = require('./database');
 const { loadAgents, loadWorkflow } = require('./agent-loader');
 
 const app = express();
@@ -81,8 +81,22 @@ app.get('/api/executions', (req, res) => {
 });
 
 app.post('/api/predict', async (req, res) => {
-  const { teamA, teamB, matchDate, venue } = req.body;
+  const { teamA, teamB, matchDate, venue, force } = req.body;
   if (!teamA || !teamB) return res.status(400).json({ error: '请填写两支球队名称' });
+
+  // 非强制模式下，检查是否已有缓存预测
+  if (!force) {
+    const cached = getCachedPrediction(teamA, teamB);
+    if (cached) {
+      // 有缓存，先检测是否有重大新闻需要清缓存
+      const majorNews = await checkForMajorNews(teamA, teamB);
+      if (!majorNews) {
+        cached.results = JSON.parse(cached.results);
+        return res.json({ executionId: cached.id, status: cached.status });
+      }
+      // 有重大新闻，缓存已清，继续走完整预测流程
+    }
+  }
 
   const agents = loadAgents();
   const agentMap = {};
@@ -95,6 +109,9 @@ app.post('/api/predict', async (req, res) => {
     INSERT INTO executions (id, team_a, team_b, match_date, venue, status)
     VALUES (?, ?, ?, ?, ?, 'running')
   `).run(id, teamA, teamB, matchDate || '', venue || '');
+
+  // 缓存此次预测（team_a, team_b → execution_id）
+  cachePrediction(teamA, teamB, id);
 
   runWorkflow(id, teamA, teamB, matchDate, venue, agents, agentMap, workflow).catch(err => {
     console.error('Workflow error:', err);
@@ -121,21 +138,22 @@ app.get('/api/executions/:id', (req, res) => {
 
 const TAVILY_KEY = process.env.TAVILY_API_KEY || '';
 
-async function searchTavily(query) {
+async function searchTavily(query, days) {
   const https = require('https');
   return new Promise((resolve) => {
-    const body = JSON.stringify({
+    const body = {
       api_key: TAVILY_KEY,
       query,
-      search_depth: 'basic',
+      search_depth: 'advanced',
       max_results: 5,
       include_answer: true
-    });
+    };
+    if (days) body.days = days;
     const req = https.request({
       hostname: 'api.tavily.com',
       path: '/search',
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(JSON.stringify(body)) },
       timeout: 8000
     }, (res) => {
       let data = '';
@@ -156,19 +174,27 @@ async function searchTavily(query) {
     });
     req.on('error', () => resolve(null));
     req.on('timeout', () => { req.destroy(); resolve(null); });
-    req.write(body);
+    req.write(JSON.stringify(body));
     req.end();
   });
 }
 
 async function gatherRealtimeIntel(teamA, teamB, matchDate) {
+  const now = new Date();
+  const month = now.getMonth() + 1;
+  const dateStr = `${now.getFullYear()}年${month}月`;
   const queries = [
-    { label: `${teamA}近况`, q: `${teamA} football team 2026 World Cup latest news squad` },
-    { label: `${teamB}近况`, q: `${teamB} football team 2026 World Cup latest news squad` },
-    { label: '交锋记录', q: `${teamA} vs ${teamB} football match history results` },
+    { label: `${teamA}近况`, q: `${teamA} ${dateStr} 世界杯 最新阵容 伤病 首发` },
+    { label: `${teamB}近况`, q: `${teamB} ${dateStr} 世界杯 最新阵容 伤病 首发` },
+    { label: '交锋记录', q: `${teamA} vs ${teamB} 历史交锋 比分 2026` },
   ];
 
-  const results = await Promise.all(queries.map(q => searchTavily(q.q)));
+  // 近况查询限定7天内，交锋记录不限时间
+  const results = await Promise.all([
+    searchTavily(queries[0].q, 7),
+    searchTavily(queries[1].q, 7),
+    searchTavily(queries[2].q),       // 历史交锋，不限时间
+  ]);
 
   const parts = [];
   for (let i = 0; i < queries.length; i++) {
@@ -184,6 +210,91 @@ async function gatherRealtimeIntel(teamA, teamB, matchDate) {
   return parts.length > 0
     ? `\n\n==== 实时搜索情报（Tavily API）====\n${parts.join('\n\n')}\n==== 搜索情报结束 ====\n`
     : '';
+}
+
+// ── 重大新闻检测（缓存失效）──
+
+const NEWS_CHECK_INTERVAL_MS = 2 * 60 * 60 * 1000; // 同一场比赛每2小时最多检查一次
+
+async function checkForMajorNews(teamA, teamB) {
+  const lastChecked = getLastChecked(teamA, teamB);
+  if (lastChecked) {
+    const elapsed = Date.now() - new Date(lastChecked + '+08:00').getTime();
+    if (elapsed < NEWS_CHECK_INTERVAL_MS) {
+      console.log(`  [新闻检查] ${teamA} vs ${teamB} 距上次检查不足2小时，跳过`);
+      return false;
+    }
+  }
+
+  console.log(`  [新闻检查] 正在检查 ${teamA} vs ${teamB} 的重大新闻...`);
+
+  // 搜索两队近期重大新闻
+  const now = new Date();
+  const dateStr = `${now.getFullYear()}年${now.getMonth() + 1}月`;
+  const queries = [
+    `${teamA} ${dateStr} 世界杯 突发 伤病 停赛 退出`,
+    `${teamB} ${dateStr} 世界杯 突发 伤病 停赛 退出`,
+    `${teamA} ${teamB} 世界杯 突发新闻 变故 ${dateStr}`,
+  ];
+
+  const results = await Promise.all(queries.map(q => searchTavily(q, 7)));
+  const newsText = results
+    .filter(r => r && r.results.length > 0)
+    .map(r => {
+      let text = r.answer || '';
+      text += '\n' + r.results.map(n => `- ${n.title}: ${n.content}`).join('\n');
+      return text;
+    })
+    .join('\n\n');
+
+  updateLastChecked(teamA, teamB);
+
+  if (!newsText.trim()) {
+    console.log('  [新闻检查] 无相关新闻，保留缓存');
+    return false;
+  }
+
+  // 让 Claude 判断是否为重大变故
+  try {
+    const Anthropic = require('@anthropic-ai/sdk');
+    const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+    const msg = await anthropic.messages.create({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 50,
+      temperature: 0,
+      system: '你是一名足球赛事分析师。判断新闻是否包含会显著改变比赛预测结果的"重大变故"。重大变故标准（严格）：核心球员（头号球星/队长/主力射手/一门）重伤或停赛、主教练突然下课、球队遭遇罢赛或重大场外危机。以下不算重大：角色球员微伤、日常轮换、媒体猜测、例行采访、训练日常、轻微不适。请只回复一个词：MAJOR_A（新闻关于球队A）、MAJOR_B（新闻关于球队B）、MAJOR_BOTH（两队都涉及）、或 MINOR（无重大变故）。',
+      messages: [{
+        role: 'user',
+        content: `球队A：${teamA}\n球队B：${teamB}\n\n最新新闻：\n${newsText.substring(0, 3000)}`
+      }],
+    });
+
+    const verdict = msg.content.filter(c => c.type === 'text').map(c => c.text).join('').trim();
+    console.log(`  [新闻检查] Claude 判定: ${verdict}`);
+
+    if (verdict.includes('MAJOR_BOTH')) {
+      console.log(`  [新闻检查] ⚠️ 两队均有重大变故！清除 ${teamA} 和 ${teamB} 所有相关预测`);
+      invalidateAllForTeam(teamA);
+      invalidateAllForTeam(teamB);
+      return true;
+    }
+    if (verdict.includes('MAJOR_A')) {
+      console.log(`  [新闻检查] ⚠️ ${teamA} 有重大变故！清除其所有相关预测`);
+      invalidateAllForTeam(teamA);
+      return true;
+    }
+    if (verdict.includes('MAJOR_B')) {
+      console.log(`  [新闻检查] ⚠️ ${teamB} 有重大变故！清除其所有相关预测`);
+      invalidateAllForTeam(teamB);
+      return true;
+    }
+
+    return false;
+  } catch (err) {
+    console.error('  [新闻检查] Claude 调用失败:', err.message);
+    return false; // 出错时保留缓存，安全优先
+  }
 }
 
 // ── 执行引擎 ──
