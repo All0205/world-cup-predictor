@@ -1,3 +1,13 @@
 node_modules/
 .env
 *.db
+predictor.db-*
+public/images/temp_*
+public/images/*sketch*
+public/images/*outline*
+public/images/mascots_*
+public/images/fifa_mascots*
+public/images/clutch*
+public/images/zayu*
+public/images/maple*
+mascots_*

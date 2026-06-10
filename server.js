@@ -1,7 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const path = require('path');
-const { db, init, getAllMatches, updateMatchTeams, getMatchesByDate, updateMatchStatus, getCompletedCountForDate, getTotalCountForDate, getCachedPrediction, cachePrediction, updateLastChecked, getLastChecked, invalidatePrediction, invalidateAllForTeam } = require('./database');
+const { pool, init, getAllMatches, updateMatchTeams, getMatchesByDate, updateMatchStatus, getCompletedCountForDate, getTotalCountForDate, getCachedPrediction, cachePrediction, updateLastChecked, getLastChecked, invalidatePrediction, invalidateAllForTeam } = require('./database');
 const { loadAgents, loadWorkflow } = require('./agent-loader');
 
 const app = express();
@@ -14,8 +14,8 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 // 生成全部日期（6月11日–7月20日），标注哪些有比赛，过滤已全部结束的日期
-function getMatchCalendar() {
-  const allMatches = getAllMatches();
+async function getMatchCalendar() {
+  const allMatches = await await getAllMatches();
   const matchMap = {};
   allMatches.forEach(m => {
     if (!matchMap[m.date]) matchMap[m.date] = [];
@@ -47,12 +47,12 @@ function getMatchCalendar() {
 
 // ── 页面路由 ──
 
-app.get('/', (req, res) => {
+app.get('/', async (req, res) => {
   autoRefreshKnockout();    // 后台自动检查淘汰赛更新
   detectCompletedMatches();  // 后台自动检测已结束的比赛
-  const calendar = getMatchCalendar();
-  const recent = db.prepare('SELECT * FROM executions ORDER BY created_at DESC LIMIT 5').all();
-  recent.forEach(r => { r.results = JSON.parse(r.results); });
+  const calendar = await getMatchCalendar();
+  const { rows: recent } = await pool.query('SELECT * FROM executions ORDER BY created_at DESC LIMIT 5');
+  recent.forEach(r => { r.results = typeof r.results === 'string' ? JSON.parse(r.results) : r.results; });
   res.render('index', { calendar, recent });
 });
 
@@ -62,26 +62,27 @@ app.get('/predict', (req, res) => {
   res.render('predict', { home, away, date: date || '', venue: venue || '' });
 });
 
-app.get('/result/:id', (req, res) => {
-  const execution = db.prepare('SELECT * FROM executions WHERE id = ?').get(req.params.id);
+app.get('/result/:id', async (req, res) => {
+  const { rows } = await pool.query('SELECT * FROM executions WHERE id = $1', [req.params.id]);
+  const execution = rows[0];
   if (!execution) return res.status(404).send('记录不存在');
-  execution.results = JSON.parse(execution.results);
+  execution.results = typeof execution.results === 'string' ? JSON.parse(execution.results) : execution.results;
   res.render('result', { execution });
 });
 
 // ── API ──
 
-app.get('/api/matches', (req, res) => {
-  res.json(getMatchCalendar());
+app.get('/api/matches', async (req, res) => {
+  res.json(await getMatchCalendar());
 });
 
 app.get('/api/agents', (req, res) => {
   res.json(loadAgents());
 });
 
-app.get('/api/executions', (req, res) => {
-  const list = db.prepare('SELECT * FROM executions ORDER BY created_at DESC LIMIT 20').all();
-  list.forEach(r => { r.results = JSON.parse(r.results); });
+app.get('/api/executions', async (req, res) => {
+  const { rows: list } = await pool.query('SELECT * FROM executions ORDER BY created_at DESC LIMIT 20');
+  list.forEach(r => { r.results = typeof r.results === 'string' ? JSON.parse(r.results) : r.results; });
   res.json(list);
 });
 
@@ -91,14 +92,14 @@ app.post('/api/predict', async (req, res) => {
 
   // 非强制模式下，检查是否已有缓存预测
   if (!force) {
-    const cached = getCachedPrediction(teamA, teamB);
+    const cached = await getCachedPrediction(teamA, teamB);
     if (cached) {
       // 有缓存，先检测是否有重大新闻需要清缓存
       const majorNews = await checkForMajorNews(teamA, teamB);
       if (!majorNews) {
         // 更新时间戳，让这次预测排到最近预测顶端
-        db.prepare('UPDATE executions SET created_at = datetime(\'now\',\'localtime\') WHERE id = ?').run(cached.id);
-        cached.results = JSON.parse(cached.results);
+        await pool.query('UPDATE executions SET created_at = NOW() WHERE id = $1', [cached.id]);
+        cached.results = typeof cached.results === 'string' ? JSON.parse(cached.results) : cached.results;
         return res.json({ executionId: cached.id, status: cached.status });
       }
       // 有重大新闻，缓存已清，继续走完整预测流程
@@ -112,32 +113,33 @@ app.post('/api/predict', async (req, res) => {
   const workflow = loadWorkflow();
 
   const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-  db.prepare(`
-    INSERT INTO executions (id, team_a, team_b, match_date, venue, status)
-    VALUES (?, ?, ?, ?, ?, 'running')
-  `).run(id, teamA, teamB, matchDate || '', venue || '');
+  await pool.query(
+    'INSERT INTO executions (id, team_a, team_b, match_date, venue, status) VALUES ($1, $2, $3, $4, $5, $6)',
+    [id, teamA, teamB, matchDate || '', venue || '', 'running']
+  );
 
   // 缓存此次预测（team_a, team_b → execution_id）
-  cachePrediction(teamA, teamB, id);
+  await cachePrediction(teamA, teamB, id);
 
-  runWorkflow(id, teamA, teamB, matchDate, venue, agents, agentMap, workflow).catch(err => {
+  runWorkflow(id, teamA, teamB, matchDate, venue, agents, agentMap, workflow).catch(async err => {
     console.error('Workflow error:', err);
-    const results = db.prepare('SELECT results FROM executions WHERE id = ?').get(id);
-    if (results) {
-      const arr = JSON.parse(results.results);
+    const { rows } = await pool.query('SELECT results FROM executions WHERE id = $1', [id]);
+    if (rows.length > 0) {
+      const arr = typeof rows[0].results === 'string' ? JSON.parse(rows[0].results) : rows[0].results;
       arr.push({ agentName: '系统', status: 'failed', output: err.message });
-      db.prepare('UPDATE executions SET status=?, results=?, completed_at=datetime(\'now\',\'localtime\') WHERE id=?')
-        .run('failed', JSON.stringify(arr), id);
+      await pool.query('UPDATE executions SET status=$1, results=$2, completed_at=NOW() WHERE id=$3',
+        ['failed', JSON.stringify(arr), id]);
     }
   });
 
   res.json({ executionId: id, status: 'running' });
 });
 
-app.get('/api/executions/:id', (req, res) => {
-  const execution = db.prepare('SELECT * FROM executions WHERE id = ?').get(req.params.id);
+app.get('/api/executions/:id', async (req, res) => {
+  const { rows } = await pool.query('SELECT * FROM executions WHERE id = $1', [req.params.id]);
+  const execution = rows[0];
   if (!execution) return res.status(404).json({ error: 'Not found' });
-  execution.results = JSON.parse(execution.results);
+  execution.results = typeof execution.results === 'string' ? JSON.parse(execution.results) : execution.results;
   res.json(execution);
 });
 
@@ -152,7 +154,7 @@ async function autoRefreshKnockout() {
   lastAutoRefresh = now;
 
   try {
-    const allMatches = getAllMatches();
+    const allMatches = await await getAllMatches();
     const placeholders = allMatches.filter(m =>
       m.home.includes('胜者') || m.home.includes('败者') ||
       m.home.includes('组') || m.away.includes('组') ||
@@ -200,7 +202,7 @@ async function autoRefreshKnockout() {
         (m.home.includes('胜者') || m.home.includes('败者') || m.home.includes('组'))
       );
       if (match) {
-        updateMatchTeams(match.id, update.home, update.away);
+        await updateMatchTeams(match.id, update.home, update.away);
         updated++;
       }
     }
@@ -214,7 +216,7 @@ async function autoRefreshKnockout() {
 
 async function detectCompletedMatches() {
   try {
-    const allMatches = getAllMatches();
+    const allMatches = await getAllMatches();
     const upcoming = allMatches.filter(m =>
       m.status === 'upcoming' && !m.home.includes('组') && !m.home.includes('胜者') && !m.home.includes('败者') &&
       !m.away.includes('组') && !m.away.includes('胜者') && !m.away.includes('败者')
@@ -273,7 +275,7 @@ async function detectCompletedMatches() {
       if (!r.completed) continue;
       const match = dueMatches.find(m => m.home === r.home && m.away === r.away);
       if (match) {
-        updateMatchStatus(match.id, 'completed');
+        await updateMatchStatus(match.id, 'completed');
         console.log('  [结果检测] ✅', match.date, match.home, 'vs', match.away, '已结束');
         updated++;
       }
@@ -286,7 +288,7 @@ async function detectCompletedMatches() {
 
 app.post('/api/matches/refresh', async (req, res) => {
   try {
-    const allMatches = getAllMatches();
+    const allMatches = await await getAllMatches();
     const placeholders = allMatches.filter(m =>
       m.home.includes('胜者') || m.home.includes('败者') ||
       m.home.includes('组') || m.away.includes('组') ||
@@ -347,7 +349,7 @@ app.post('/api/matches/refresh', async (req, res) => {
         (m.home.includes('胜者') || m.home.includes('败者') || m.home.includes('组'))
       );
       if (match) {
-        updateMatchTeams(match.id, update.home, update.away);
+        await updateMatchTeams(match.id, update.home, update.away);
         console.log(`  [赛程更新] #${match.id} ${update.date} ${update.stage}: ${update.home} vs ${update.away}`);
         updated++;
       }
@@ -361,10 +363,10 @@ app.post('/api/matches/refresh', async (req, res) => {
 });
 
 // 手动更新某场比赛的队名
-app.post('/api/matches/update', (req, res) => {
+app.post('/api/matches/update', async (req, res) => {
   const { id, home, away } = req.body;
   if (!id || !home || !away) return res.status(400).json({ error: '缺少 id/home/away' });
-  updateMatchTeams(id, home, away);
+  await updateMatchTeams(id, home, away);
   res.json({ success: true, id, home, away });
 });
 
@@ -451,7 +453,7 @@ async function gatherRealtimeIntel(teamA, teamB, matchDate) {
 const NEWS_CHECK_INTERVAL_MS = 2 * 60 * 60 * 1000; // 同一场比赛每2小时最多检查一次
 
 async function checkForMajorNews(teamA, teamB) {
-  const lastChecked = getLastChecked(teamA, teamB);
+  const lastChecked = await getLastChecked(teamA, teamB);
   if (lastChecked) {
     const elapsed = Date.now() - new Date(lastChecked + '+08:00').getTime();
     if (elapsed < NEWS_CHECK_INTERVAL_MS) {
@@ -481,7 +483,7 @@ async function checkForMajorNews(teamA, teamB) {
     })
     .join('\n\n');
 
-  updateLastChecked(teamA, teamB);
+  await updateLastChecked(teamA, teamB);
 
   if (!newsText.trim()) {
     console.log('  [新闻检查] 无相关新闻，保留缓存');
@@ -509,18 +511,18 @@ async function checkForMajorNews(teamA, teamB) {
 
     if (verdict.includes('MAJOR_BOTH')) {
       console.log(`  [新闻检查] ⚠️ 两队均有重大变故！清除 ${teamA} 和 ${teamB} 所有相关预测`);
-      invalidateAllForTeam(teamA);
-      invalidateAllForTeam(teamB);
+      await invalidateAllForTeam(teamA);
+      await invalidateAllForTeam(teamB);
       return true;
     }
     if (verdict.includes('MAJOR_A')) {
       console.log(`  [新闻检查] ⚠️ ${teamA} 有重大变故！清除其所有相关预测`);
-      invalidateAllForTeam(teamA);
+      await invalidateAllForTeam(teamA);
       return true;
     }
     if (verdict.includes('MAJOR_B')) {
       console.log(`  [新闻检查] ⚠️ ${teamB} 有重大变故！清除其所有相关预测`);
-      invalidateAllForTeam(teamB);
+      await invalidateAllForTeam(teamB);
       return true;
     }
 
@@ -540,9 +542,9 @@ async function runWorkflow(id, teamA, teamB, matchDate, venue, agents, agentMap,
   const allResults = [];
   const input = `球队A：${teamA}\n球队B：${teamB}\n比赛时间：${matchDate || '未指定'}\n比赛地点：${venue || '未指定'}`;
 
-  function saveResults() {
-    db.prepare('UPDATE executions SET results = ? WHERE id = ?')
-      .run(JSON.stringify(allResults), id);
+  async function saveResults() {
+    await pool.query('UPDATE executions SET results = $1 WHERE id = $2',
+      [JSON.stringify(allResults), id]);
   }
 
   // 预搜索实时情报（并行，不阻塞）
@@ -617,19 +619,21 @@ async function runWorkflow(id, teamA, teamB, matchDate, venue, agents, agentMap,
         resultEntry.output = '调用失败: ' + err.message;
       }
 
-      saveResults();
+      await saveResults();
       executed.add(node.name);
     }
   }
 
-  db.prepare('UPDATE executions SET status=?, completed_at=datetime(\'now\',\'localtime\') WHERE id=?')
-    .run('completed', id);
+  await pool.query('UPDATE executions SET status=$1, completed_at=NOW() WHERE id=$2',
+    ['completed', id]);
 }
 
 // ── 启动 ──
-init();
-app.listen(PORT, () => {
-  console.log(`⚽ 世界杯预测平台已启动: http://localhost:${PORT}`);
-  console.log(`   Agent数量: ${loadAgents().length}`);
-  console.log(`   工作流节点: ${loadWorkflow().nodes.length}`);
-});
+(async () => {
+  await init();
+  app.listen(PORT, () => {
+    console.log(`⚽ 世界杯预测平台已启动: http://localhost:${PORT}`);
+    console.log(`   Agent数量: ${loadAgents().length}`);
+    console.log(`   工作流节点: ${loadWorkflow().nodes.length}`);
+  });
+})();
