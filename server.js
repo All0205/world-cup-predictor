@@ -96,6 +96,8 @@ app.post('/api/predict', async (req, res) => {
       // 有缓存，先检测是否有重大新闻需要清缓存
       const majorNews = await checkForMajorNews(teamA, teamB);
       if (!majorNews) {
+        // 更新时间戳，让这次预测排到最近预测顶端
+        db.prepare('UPDATE executions SET created_at = datetime(\'now\',\'localtime\') WHERE id = ?').run(cached.id);
         cached.results = JSON.parse(cached.results);
         return res.json({ executionId: cached.id, status: cached.status });
       }
