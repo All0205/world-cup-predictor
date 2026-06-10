@@ -5,7 +5,7 @@ const { pool, init, getAllMatches, updateMatchTeams, getMatchesByDate, updateMat
 const { loadAgents, loadWorkflow } = require('./agent-loader');
 
 const app = express();
-const PORT = 5051;
+const PORT = process.env.PORT || 5051;
 
 app.set('view engine', 'ejs');
 app.set('views', path.join(__dirname, 'views'));
