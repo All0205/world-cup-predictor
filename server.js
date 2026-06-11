@@ -3,6 +3,7 @@ const express = require('express');
 const path = require('path');
 const { pool, init, getAllMatches, updateMatchTeams, getMatchesByDate, updateMatchStatus, getCompletedCountForDate, getTotalCountForDate, getCachedPrediction, cachePrediction, updateLastChecked, getLastChecked, invalidatePrediction, invalidateAllForTeam } = require('./database');
 const { loadAgents, loadWorkflow } = require('./agent-loader');
+const { predictFromElo } = require('./elo');
 
 const app = express();
 const PORT = process.env.PORT || 5051;
@@ -23,7 +24,7 @@ async function getMatchCalendar() {
   });
 
   const result = [];
-  const start = new Date(2026, 5, 11);
+  const start = new Date(2026, 5, 12);  // 北京时间：首场揭幕战 6月12日 03:00
   const end = new Date(2026, 6, 20);
 
   for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
@@ -258,7 +259,7 @@ async function detectCompletedMatches() {
       model: 'claude-sonnet-4-6',
       max_tokens: 512,
       temperature: 0,
-      system: '你是一个比赛结果提取器。根据新闻判断哪些比赛已经结束（有最终比分）。输出JSON数组，每项格式：{"home":"球队A","away":"球队B","completed":true}。只输出已确认结束的比赛，不确定的比赛不要包含。如果没有任何比赛确认结束，输出空数组[]。',
+      system: '你是一个比赛结果提取器。严格判断标准：只有当新闻中明确出现了"最终比分""FT""全场比赛结束"或具体比分数字（如2-1、3-0等）时，才认为比赛已结束。以下情况绝对不能标记为completed：赛前预测、前瞻报道、首发名单公布、"即将开始""揭幕战打响"等预热新闻、训练新闻、球员采访。宁可漏判也不能错判。输出JSON数组，每项格式：{"home":"球队A","away":"球队B","completed":true,"score":"X-X"}。如果没有任何比赛确认结束（即找不到具体比分），输出空数组[]。',
       messages: [{
         role: 'user',
         content: `以下比赛可能已经进行，请判断哪些已经结束：\n${dueMatches.map(m => `- ${m.date} ${m.home} vs ${m.away} (${m.stage})`).join('\n')}\n\n最新新闻：\n${newsText.substring(0, 3000)}`
@@ -448,6 +449,56 @@ async function gatherRealtimeIntel(teamA, teamB, matchDate) {
     : '';
 }
 
+// ── ELO 伤病量化 ──
+
+async function quantifyEloAdjustment(teamA, teamB, intelText) {
+  if (!intelText) return { adjustA: 0, adjustB: 0, reason: '无情报，不调整' };
+
+  try {
+    const Anthropic = require('@anthropic-ai/sdk');
+    const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+    const msg = await anthropic.messages.create({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 100,
+      temperature: 0,
+      system: `你是足球ELO评分调整专家。基于情报中的伤病/停赛信息，量化ELO调整值。
+
+规则：
+- 仅根据"确认缺席/赛季报销/确定无缘"的球员扣分。"可能""疑似""出战成疑"不扣分
+- 一门确认缺席: -40~-50
+- 队长/防线核心确认缺席: -30~-40
+- 头号射手确认缺席: -30~-40
+- 主力中场/边锋确认缺席: -20~-30 (每人)
+- 多名主力缺席可累加，但单队上限 -80
+- 球员伤愈复出/确认回归: +20~+30
+- 没有确认缺席则 adjust 均为 0
+
+输出严格JSON，不要其他文字：
+{"adjustA":-XX,"adjustB":-YY,"reason":"球队A: xxx; 球队B: xxx"}`,
+      messages: [{
+        role: 'user',
+        content: `球队A：${teamA}\n球队B：${teamB}\n\n情报：\n${intelText.substring(0, 3000)}`
+      }],
+    });
+
+    const reply = msg.content.filter(c => c.type === 'text').map(c => c.text).join('').trim();
+    console.log(`  [ELO调整] Claude回复: ${reply}`);
+
+    const jsonMatch = reply.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      const parsed = JSON.parse(jsonMatch[0]);
+      parsed.adjustA = parseInt(parsed.adjustA) || 0;
+      parsed.adjustB = parseInt(parsed.adjustB) || 0;
+      console.log(`  [ELO调整] ${teamA}: ${parsed.adjustA}, ${teamB}: ${parsed.adjustB} — ${parsed.reason}`);
+      return { adjustA: parsed.adjustA, adjustB: parsed.adjustB, reason: parsed.reason || '' };
+    }
+  } catch (e) {
+    console.error('  [ELO调整] 失败:', e.message);
+  }
+  return { adjustA: 0, adjustB: 0, reason: '解析失败' };
+}
+
 // ── 重大新闻检测（缓存失效）──
 
 const NEWS_CHECK_INTERVAL_MS = 2 * 60 * 60 * 1000; // 同一场比赛每2小时最多检查一次
@@ -499,7 +550,7 @@ async function checkForMajorNews(teamA, teamB) {
       model: 'claude-sonnet-4-6',
       max_tokens: 50,
       temperature: 0,
-      system: '你是一名足球赛事分析师。判断新闻是否包含会显著改变比赛预测结果的"重大变故"。重大变故标准（严格）：核心球员（头号球星/队长/主力射手/一门）重伤或停赛、主教练突然下课、球队遭遇罢赛或重大场外危机。以下不算重大：角色球员微伤、日常轮换、媒体猜测、例行采访、训练日常、轻微不适。请只回复一个词：MAJOR_A（新闻关于球队A）、MAJOR_B（新闻关于球队B）、MAJOR_BOTH（两队都涉及）、或 MINOR（无重大变故）。',
+      system: '你是足球赛事分析师。判断是否有"已确认的"重大变故会显著改变预测。严格标准：只有官方确认的核心球员（头号球星/队长/主力射手/一门）"确定缺席"本轮才算。以下全部算MINOR：任何"可能""疑似""出战成疑""或"的表述、角色球员、媒体猜测、训练日常、战术调整、换帅传闻。宁愿漏判也不能错判——只要有一丝不确定就选MINOR。只回复一个词：MAJOR_A / MAJOR_B / MAJOR_BOTH / MINOR。',
       messages: [{
         role: 'user',
         content: `球队A：${teamA}\n球队B：${teamB}\n\n最新新闻：\n${newsText.substring(0, 3000)}`
@@ -547,7 +598,7 @@ async function runWorkflow(id, teamA, teamB, matchDate, venue, agents, agentMap,
       [JSON.stringify(allResults), id]);
   }
 
-  // 预搜索实时情报（并行，不阻塞）
+  // 1. 预搜索实时情报
   let realtimeIntel = '';
   try {
     realtimeIntel = await gatherRealtimeIntel(teamA, teamB, matchDate);
@@ -555,6 +606,26 @@ async function runWorkflow(id, teamA, teamB, matchDate, venue, agents, agentMap,
   } catch (e) {
     console.error('  [搜索] 失败:', e.message);
   }
+
+  // 2. 情报 → ELO 量化调整
+  const eloAdj = await quantifyEloAdjustment(teamA, teamB, realtimeIntel);
+
+  // 3. 计算 ELO 基线（含伤病调整）
+  const eloBaseline = predictFromElo(teamA, teamB, venue || '', eloAdj.adjustA, eloAdj.adjustB);
+  const eloBlock = `
+==== ELO 量化基线 ====
+- ${teamA} 原始 ELO: ${eloBaseline.eloARaw - eloAdj.adjustA}${eloAdj.adjustA !== 0 ? ` → 伤病调整 ${eloAdj.adjustA} → 有效 ELO: ${eloBaseline.eloARaw}` : ''}
+- ${teamB} 原始 ELO: ${eloBaseline.eloBRaw - eloAdj.adjustB}${eloAdj.adjustB !== 0 ? ` → 伤病调整 ${eloAdj.adjustB} → 有效 ELO: ${eloBaseline.eloBRaw}` : ''}
+- ${eloBaseline.homeAdvantage ? `主场加成: ${eloBaseline.homeAdvantage} +100` : '中立场'}
+- ELO 差值: ${eloBaseline.eloDiff > 0 ? `${teamA} 高 ${eloBaseline.eloDiff} 分` : `${teamB} 高 ${-eloBaseline.eloDiff} 分`}
+- 调整原因: ${eloAdj.reason}
+- 预期进球 (xG): ${teamA} ${eloBaseline.xgA} — ${teamB} ${eloBaseline.xgB}
+- 胜平负概率: ${teamA}胜 ${eloBaseline.homeWinProb}% / 平 ${eloBaseline.drawProb}% / ${teamB}胜 ${eloBaseline.awayWinProb}%
+- 量化模型最可能比分: ${eloBaseline.mostLikely.map(s => `${s.score} (${s.prob}%)`).join(', ')}
+==== ELO 基线结束 ====
+
+⚠️ ELO 基线已综合伤病调整。你的任务是基于情报中的其他因素（战术、状态、天气等），判断是否需进一步偏离。`;
+  // ═══ ELO 基线结束 ═══
 
   const nodeMap = {};
   for (const n of workflow.nodes) nodeMap[n.name] = n;
@@ -580,11 +651,11 @@ async function runWorkflow(id, teamA, teamB, matchDate, venue, agents, agentMap,
       allResults.push(resultEntry);
       saveResults();
 
-      let agentInput = input;
+      let agentInput = input + eloBlock;
       // 第一个Agent注入实时搜索情报
       const isFirstAgent = executed.size === 0;
       if (isFirstAgent && realtimeIntel) {
-        agentInput = input + realtimeIntel;
+        agentInput = input + realtimeIntel + eloBlock;
       }
 
       const upstreams = allResults.filter(r => {
@@ -594,11 +665,11 @@ async function runWorkflow(id, teamA, teamB, matchDate, venue, agents, agentMap,
       if (upstreams.length > 0) {
         const upstreamText = upstreams.map(u => u.output || '').filter(Boolean).join('\n\n---\n\n');
         if (upstreamText) {
-          agentInput = `${input}\n\n==== 上游Agent分析结果 ====\n${upstreamText}`;
+          agentInput = `${input}\n\n==== 上游Agent分析结果 ====\n${upstreamText}\n\n${eloBlock}`;
         }
       }
 
-      const temp = 0.3 + Math.random() * 0.3;
+      const temp = 0.3;  // 固定温度，确保相同输入产生相同预测
 
       try {
         const msg = await anthropic.messages.create({
