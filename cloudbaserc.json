@@ -1,0 +1,29 @@
+{
+  "version": "2.0",
+  "envId": "prod-d5ghmn0gycf756f21",
+  "$schema": "https://framework-1258016615.tcloudbaseapp.com/schema/latest.json",
+  "framework": {
+    "name": "world-cup-predictor",
+    "plugins": {
+      "container": {
+        "use": "@cloudbase/framework-plugin-container",
+        "inputs": {
+          "serviceName": "world-cup-predictor",
+          "servicePath": "/",
+          "uploadType": "package",
+          "containerPort": 5051,
+          "dockerfilePath": "Dockerfile",
+          "buildDir": ".",
+          "envVariables": {
+            "DATABASE_URL": "postgresql://neondb_owner:npg_DvMxE08tBqoc@ep-sweet-thunder-aolem6td-pooler.c-2.ap-southeast-1.aws.neon.tech/neondb?sslmode=require",
+            "TAVILY_API_KEY": "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",
+            "DEEPSEEK_API_KEY": "sk-98b88c2ebe144e86afee0550abeff454"
+          }
+        }
+      }
+    }
+  },
+  "cloudrun": {
+    "name": "express-ayj8"
+  }
+}
