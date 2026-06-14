@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>管理 - 比分录入</title>
+  <link rel="stylesheet" href="/css/style.css">
+  <style>
+    .admin-container { max-width: 800px; margin: 0 auto; padding: 16px; }
+    .day-group { margin-bottom: 24px; }
+    .day-title { font-size: 18px; font-weight: bold; margin: 12px 0 8px; padding: 8px 12px; background: #f0f0f0; border-radius: 8px; }
+    .match-row { display: flex; align-items: center; gap: 10px; padding: 10px 12px; background: #fff; border-radius: 8px; margin-bottom: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+    .match-row.completed { background: #e8f5e9; }
+    .match-teams { flex: 1; font-weight: 500; }
+    .match-info { font-size: 12px; color: #888; }
+    .score-inputs { display: flex; align-items: center; gap: 6px; }
+    .score-inputs input { width: 44px; height: 36px; text-align: center; font-size: 18px; font-weight: bold; border: 2px solid #ddd; border-radius: 6px; }
+    .score-inputs input:focus { border-color: #4CAF50; outline: none; }
+    .score-inputs span { font-weight: bold; color: #666; }
+    .btn-save { padding: 8px 16px; background: #4CAF50; color: #fff; border: none; border-radius: 6px; font-size: 14px; cursor: pointer; }
+    .btn-save:hover { background: #388E3C; }
+    .btn-save:disabled { background: #ccc; cursor: not-allowed; }
+    .saved-score { font-size: 20px; font-weight: bold; color: #2e7d32; }
+    .toast { position: fixed; top: 16px; left: 50%; transform: translateX(-50%); padding: 12px 24px; border-radius: 8px; color: #fff; font-weight: bold; z-index: 999; }
+    .toast.success { background: #4CAF50; }
+    .toast.error { background: #f44336; }
+    .back-link { display: inline-block; margin-bottom: 16px; color: #1976D2; text-decoration: none; }
+  </style>
+</head>
+<body>
+  <div class="admin-container">
+    <a href="/" class="back-link">← 返回首页</a>
+    <h1>📋 比分录入管理</h1>
+    <p style="color:#888;margin-bottom:20px;">手动录入准确比分后，系统会自动搜索赛后详细数据（控球率、射门、战术分析等）</p>
+
+    <% Object.keys(grouped).sort().forEach(function(date) { %>
+      <div class="day-group">
+        <div class="day-title"><%= date %></div>
+        <% grouped[date].forEach(function(m) {
+          var isPlaceholder = m.home.includes('组') || m.home.includes('胜者') || m.home.includes('败者') || m.away.includes('组') || m.away.includes('胜者') || m.away.includes('败者');
+          if (isPlaceholder) return;
+        %>
+          <div class="match-row <%= m.result ? 'completed' : '' %>" id="row-<%= m.id %>">
+            <div class="match-teams">
+              <%= m.home %> vs <%= m.away %>
+              <div class="match-info"><%= m.venue %> · <%= m.stage || m.grp + '组' %></div>
+            </div>
+            <% if (m.result) { %>
+              <div class="saved-score"><%= m.result.home_score %> - <%= m.result.away_score %></div>
+              <button class="btn-save" onclick="resetMatch(<%= m.id %>)" style="background:#ff9800;font-size:12px;">修改</button>
+            <% } else { %>
+              <div class="score-inputs">
+                <input type="number" id="hs-<%= m.id %>" min="0" max="20" placeholder="0" onfocus="this.select()">
+                <span>:</span>
+                <input type="number" id="as-<%= m.id %>" min="0" max="20" placeholder="0" onfocus="this.select()">
+              </div>
+              <button class="btn-save" onclick="saveScore(<%= m.id %>, '<%= m.home %>', '<%= m.away %>')">保存</button>
+            <% } %>
+          </div>
+        <% }) %>
+      </div>
+    <% }) %>
+  </div>
+
+  <script>
+  function toast(msg, type) {
+    var t = document.createElement('div');
+    t.className = 'toast ' + type;
+    t.textContent = msg;
+    document.body.appendChild(t);
+    setTimeout(function() { t.remove(); }, 2500);
+  }
+
+  async function saveScore(matchId, home, away) {
+    var hsEl = document.getElementById('hs-' + matchId);
+    var asEl = document.getElementById('as-' + matchId);
+    var homeScore = parseInt(hsEl.value);
+    var awayScore = parseInt(asEl.value);
+    if (isNaN(homeScore) || isNaN(awayScore)) { toast('请输入双方比分', 'error'); return; }
+
+    var btn = event.target;
+    btn.disabled = true;
+    btn.textContent = '...';
+
+    try {
+      var resp = await fetch('/api/matches/score', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ matchId, homeScore, awayScore })
+      });
+      var data = await resp.json();
+      if (data.success) {
+        var row = document.getElementById('row-' + matchId);
+        row.classList.add('completed');
+        row.querySelector('.score-inputs').outerHTML = '<div class="saved-score">' + homeScore + ' - ' + awayScore + '</div>';
+        btn.outerHTML = '<span style="font-size:12px;color:#4CAF50;">✅ 已录入</span>';
+        toast(home + ' ' + homeScore + '-' + awayScore + ' ' + away + ' 已保存！', 'success');
+      } else {
+        toast(data.error || '保存失败', 'error');
+        btn.disabled = false;
+        btn.textContent = '保存';
+      }
+    } catch (err) {
+      toast('网络错误: ' + err.message, 'error');
+      btn.disabled = false;
+      btn.textContent = '保存';
+    }
+  }
+
+  async function resetMatch(matchId) {
+    if (!confirm('确定要修改这场比赛的比分吗？ELO 会重新计算。')) return;
+    try {
+      var resp = await fetch('/api/matches/reset-score', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ matchId })
+      });
+      if (resp.ok) location.reload();
+    } catch(err) { toast('重置失败: ' + err.message, 'error'); }
+  }
+  </script>
+</body>
+</html>

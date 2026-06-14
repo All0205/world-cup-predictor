@@ -16,8 +16,8 @@ function loadElo() {
   return _cache;
 }
 
-function getElo(teamName) {
-  const data = loadElo();
+function getElo(teamName, eloData) {
+  const data = eloData || loadElo();
   if (data[teamName]) return data[teamName];
 
   for (const [name, rating] of Object.entries(data)) {
@@ -58,9 +58,9 @@ function isHome(team, venue) {
   return false;
 }
 
-function predictFromElo(teamA, teamB, venue, eloAdjustA = 0, eloAdjustB = 0) {
-  const eloA = getElo(teamA) + eloAdjustA;
-  const eloB = getElo(teamB) + eloAdjustB;
+function predictFromElo(teamA, teamB, venue, eloAdjustA = 0, eloAdjustB = 0, eloData) {
+  const eloA = getElo(teamA, eloData) + eloAdjustA;
+  const eloB = getElo(teamB, eloData) + eloAdjustB;
 
   const homeA = isHome(teamA, venue);
   const homeB = isHome(teamB, venue);
@@ -107,4 +107,46 @@ function predictFromElo(teamA, teamB, venue, eloAdjustA = 0, eloAdjustB = 0) {
   };
 }
 
-module.exports = { predictFromElo, getElo, poissonProb };
+// ELO 更新计算（世界足球ELO标准公式）
+// K = 40 for World Cup; higher K means faster rating changes
+function calcEloUpdate(eloA, eloB, scoreA, scoreB, venue, teamA, teamB) {
+  const K = 40;
+
+  // 判断主队并调整ELO
+  const homeA = isHome(teamA, venue);
+  const homeB = isHome(teamB, venue);
+  let adjustedA = eloA;
+  let adjustedB = eloB;
+  if (homeA) adjustedA += HOME_ADVANTAGE;
+  if (homeB) adjustedB += HOME_ADVANTAGE;
+
+  // 预期胜率
+  const expectedA = 1 / (1 + Math.pow(10, (adjustedB - adjustedA) / 400));
+  const expectedB = 1 - expectedA;
+
+  // 实际得分
+  let actualA, actualB;
+  if (scoreA > scoreB) { actualA = 1; actualB = 0; }
+  else if (scoreA < scoreB) { actualA = 0; actualB = 1; }
+  else { actualA = 0.5; actualB = 0.5; }
+
+  // 进球差加成 (世界杯大胜/惨败额外调整)
+  const goalDiff = Math.abs(scoreA - scoreB);
+  let goalFactor = 1;
+  if (goalDiff >= 4) goalFactor = 1.5;
+  else if (goalDiff >= 3) goalFactor = 1.25;
+  else if (goalDiff >= 2) goalFactor = 1.1;
+
+  const newEloA = Math.round(eloA + K * goalFactor * (actualA - expectedA));
+  const newEloB = Math.round(eloB + K * goalFactor * (actualB - expectedB));
+
+  return {
+    newEloA, newEloB,
+    deltaA: newEloA - eloA,
+    deltaB: newEloB - eloB,
+    expectedA: Math.round(expectedA * 100) / 100,
+    expectedB: Math.round(expectedB * 100) / 100
+  };
+}
+
+module.exports = { predictFromElo, getElo, poissonProb, calcEloUpdate };
